@@ -1,10 +1,16 @@
 streamlit==1.40.1
-
-# OpenAI Python SDK (chat + vision)
-openai>=1.51.0
-
-# For loading environment variables locally (optional, but handy)
+openai==1.51.0
 python-dotenv==1.0.1
 
-# PDF → image conversion for calendar parsing
-PyMuPDF==1.24.3
+# PyMuPDF for PDF → PNG conversion (no external dependencies)
+PyMuPDF==1.24.9
+
+# Email + IMAP
+beautifulsoup4==4.12.3
+
+# For IMAP parsing (pure Python)
+imapclient==2.3.1
+
+# For timezone support
+pytz==2024.2
+

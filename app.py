@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 from openai import OpenAI
 
-# PDF conversion
+# PDF → PNG via PyMuPDF
 import fitz  # PyMuPDF
 
 
@@ -40,10 +40,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Load secrets (Streamlit Cloud) or env
+# Load secrets (Streamlit Cloud) or environment
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-if OPENAI_API_KEY:
-    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 SMTP_USER = st.secrets.get("SMTP_USER", os.environ.get("SMTP_USER", ""))
 SMTP_PASSWORD = st.secrets.get("SMTP_PASSWORD", os.environ.get("SMTP_PASSWORD", ""))
@@ -55,6 +53,10 @@ IMAP_PORT = int(st.secrets.get("IMAP_PORT", os.environ.get("IMAP_PORT", 993)))
 
 if not OPENAI_API_KEY:
     st.warning("OPENAI_API_KEY is not set in Streamlit secrets or environment.")
+
+# Ensure OpenAI client picks the right key
+if OPENAI_API_KEY:
+    os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 
 client = OpenAI()
 
@@ -135,7 +137,7 @@ def send_email_with_ics(
 
 
 # =========================
-#  PDF → PNG HELPERS
+#  PDF → PNG HELPER
 # =========================
 
 def pdf_to_png(file_bytes: bytes) -> bytes:
@@ -148,17 +150,19 @@ def pdf_to_png(file_bytes: bytes) -> bytes:
 
 
 # =========================
-#  CALENDAR PARSING (VISION)
+#  CALENDAR PARSING
 # =========================
 
 def parse_calendar(file_bytes: bytes, filename: str):
     """
-    Parse a weekly free/busy calendar (PDF or image) into free slots using GPT-4o mini.
-    Returns a list of dicts: {"date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM"}.
+    Parse a calendar screenshot (PDF, PNG, JPG) into free slots using GPT-4o-mini.
+    Returns a list of dicts:
+    [{"date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM"}, ...]
     """
+    filename_lower = filename.lower()
 
-    # 1. Normalise to an image (PNG) if PDF
-    if filename.lower().endswith(".pdf"):
+    # If PDF → convert first page to PNG
+    if filename_lower.endswith(".pdf"):
         try:
             file_bytes = pdf_to_png(file_bytes)
             mime = "image/png"
@@ -166,19 +170,18 @@ def parse_calendar(file_bytes: bytes, filename: str):
             st.error(f"PDF conversion failed: {e}")
             return []
     else:
-        ext = filename.lower().split(".")[-1]
-        if ext in ["png"]:
+        ext = filename_lower.rsplit(".", 1)[-1]
+        if ext == "png":
             mime = "image/png"
         else:
             mime = "image/jpeg"
 
-    # 2. Base64 encode and build data URI
     b64 = base64.b64encode(file_bytes).decode("utf-8")
-    data_uri = f"data:{mime};base64,{b64}"
+    data_url = f"data:{mime};base64,{b64}"
 
     prompt = """
-Extract all AVAILABLE free time slots from this weekly calendar image.
-Return ONLY valid JSON like:
+Extract all AVAILABLE free time slots from this weekly calendar.
+Return ONLY valid JSON with this exact structure (no extra text):
 
 {
   "slots": [
@@ -188,10 +191,10 @@ Return ONLY valid JSON like:
 }
 
 Rules:
-- Only include genuinely free time for the hiring manager.
-- Ignore any busy/blocked time.
-- Use 24-hour time.
-- Output strictly valid JSON. No commentary.
+- "date" must be in ISO format YYYY-MM-DD.
+- "start" and "end" must be 24-hour HH:MM.
+- Only include times when the hiring manager is FREE.
+- Output strictly valid JSON. No comments or explanation.
 """.strip()
 
     try:
@@ -201,7 +204,7 @@ Rules:
             messages=[
                 {
                     "role": "system",
-                    "content": "You extract clean free time slots from calendar screenshots.",
+                    "content": "You are an assistant that extracts clean, machine-readable time slots from calendar screenshots.",
                 },
                 {
                     "role": "user",
@@ -209,7 +212,7 @@ Rules:
                         {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
-                            "image_url": {"url": data_uri},
+                            "image_url": {"url": data_url},
                         },
                     ],
                 },
@@ -220,15 +223,26 @@ Rules:
         st.error(f"Error calling OpenAI for calendar parsing: {e}")
         return []
 
-    # Decode JSON
+    # Try to decode JSON
+    def try_parse(text: str):
+        try:
+            return json.loads(text)
+        except Exception:
+            # Try to rescue JSON from within surrounding text
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if m:
+                return json.loads(m.group(0))
+            raise
+
     try:
-        obj = json.loads(raw)
-        if "slots" in obj and isinstance(obj["slots"], list):
-            return obj["slots"]
-        st.error("Model returned JSON, but missing 'slots' key.")
-        return []
+        obj = try_parse(raw)
+        slots = obj.get("slots", [])
+        if not isinstance(slots, list):
+            st.error("Model returned JSON but 'slots' is not a list.")
+            return []
+        return slots
     except Exception as e:
-        st.error(f"Could not parse model JSON: {e}")
+        st.error(f"Could not parse JSON from model: {e}")
         st.code(raw)
         return []
 
@@ -250,15 +264,14 @@ def generate_scheduling_email(
     if not slots:
         return "No slots available."
 
-    slot_lines = []
-    for i, s in enumerate(slots, start=1):
-        slot_lines.append(
-            f"{i}. {s['date']} {s['start']}–{s['end']} ({cand_tz})"
-        )
+    slot_lines = [
+        f"{i}. {s['date']} {s['start']}–{s['end']} ({cand_tz})"
+        for i, s in enumerate(slots, start=1)
+    ]
     slot_text = "\n".join(slot_lines)
 
     prompt = f"""
-You are an expert in-house recruiter.
+You are an expert internal recruiter.
 
 Write a warm, concise and professional email to a job candidate to offer interview time options.
 
@@ -273,13 +286,13 @@ Time options (already converted to candidate's timezone):
 {slot_text}
 
 Instructions:
-- Clearly label the options with the numbers 1, 2, 3, ...
+- Clearly list the options with the numbers 1, 2, 3, ...
 - Ask the candidate to reply ONLY with the option number that suits them best,
   or to propose alternative times if none work.
 - Be friendly but businesslike.
 - Sign off as the recruiter on behalf of the hiring manager.
 - Do NOT include a subject line (body only).
-    """.strip()
+""".strip()
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
@@ -394,7 +407,6 @@ def build_ics_event(
     - Interview type: "Teams" or "Face to face"
     - Recruiter is optional attendee.
     """
-
     tz = ZoneInfo(hm_tz)
 
     start_dt = datetime.fromisoformat(f"{slot['date']}T{slot['start']}:00").replace(
@@ -413,20 +425,18 @@ def build_ics_event(
         summary = f"Teams Interview – {role} at {company}"
         location = "Microsoft Teams"
         desc = (
-            f"Online interview via Microsoft Teams.\n\n"
-            f"Joining details:\n{location_or_instructions.strip()}\n\n"
-            f"Candidate: {candidate_name}\nHiring Manager: {hm_name}\nRecruiter: {recruiter_name}"
+            "Online interview via Microsoft Teams.\\n\\n"
+            f"Joining details:\\n{location_or_instructions.strip()}\\n\\n"
+            f"Candidate: {candidate_name}\\nHiring Manager: {hm_name}\\nRecruiter: {recruiter_name}"
         )
     else:
         summary = f"Interview – {role} at {company}"
         location = "On-site"
         desc = (
-            f"Face-to-face interview.\n\n"
-            f"Location / instructions:\n{location_or_instructions.strip()}\n\n"
-            f"Candidate: {candidate_name}\nHiring Manager: {hm_name}\nRecruiter: {recruiter_name}"
+            "Face-to-face interview.\\n\\n"
+            f"Location / instructions:\\n{location_or_instructions.strip()}\\n\\n"
+            f"Candidate: {candidate_name}\\nHiring Manager: {hm_name}\\nRecruiter: {recruiter_name}"
         )
-
-    desc = desc.replace("\n", "\\n")
 
     ics = f"""BEGIN:VCALENDAR
 VERSION:2.0
@@ -475,9 +485,8 @@ with tab_main:
         hm_name = st.text_input("Hiring manager name", value="Martin McDonald")
         hm_email = st.text_input("Hiring manager email", value="martinmcd21@hotmail.com")
         hm_tz = st.text_input(
-            "Hiring manager timezone (IANA)",
+            "Hiring manager timezone (IANA, e.g. Europe/London, America/New_York)",
             value="Europe/London",
-            help="Example: Europe/London, America/New_York",
         )
 
         company = st.text_input("Company name", value="PowerDash HR")
@@ -497,10 +506,12 @@ with tab_main:
             type=["pdf", "png", "jpg", "jpeg"],
         )
 
-        parse_btn = st.button("Parse availability", type="primary", disabled=not uploaded)
+        parse_btn = st.button(
+            "Parse availability", type="primary", disabled=not uploaded
+        )
 
         if parse_btn and uploaded is not None:
-            with st.spinner("Parsing calendar with GPT-4o mini..."):
+            with st.spinner("Parsing calendar with GPT-4o-mini..."):
                 slots = parse_calendar(uploaded.read(), uploaded.name)
                 st.session_state["slots"] = slots
 
@@ -519,9 +530,8 @@ with tab_main:
             "Candidate email", value="ruthnicholson1@hotmail.com"
         )
         cand_tz = st.text_input(
-            "Candidate time zone (IANA)",
+            "Candidate timezone (IANA, e.g. Europe/London, America/New_York)",
             value="Europe/London",
-            help="Example: Europe/London, America/New_York",
         )
 
         st.markdown("### Scheduling email")
@@ -532,7 +542,7 @@ with tab_main:
         )
 
         if gen_email_btn and slots:
-            with st.spinner("Generating email with GPT-4o mini..."):
+            with st.spinner("Generating email with GPT-4o-mini..."):
                 body = generate_scheduling_email(
                     cand_name,
                     cand_email,
@@ -545,7 +555,7 @@ with tab_main:
                 st.session_state["email_body"] = body
 
         email_body = st.text_area(
-            "Email preview (from scheduler mailbox)",
+            "Email preview (from scheduling mailbox)",
             value=st.session_state.get("email_body", ""),
             height=260,
         )
@@ -562,10 +572,9 @@ with tab_main:
                     email_body,
                     cc=[recruiter_email],
                 )
+                st.success("Email sent from scheduling mailbox to candidate. 🎉")
             except Exception as e:
                 st.error(f"Error sending email: {e}")
-            else:
-                st.success("Email sent from scheduling mailbox to candidate. 🎉")
 
 
 # -------------
@@ -576,7 +585,7 @@ with tab_inbox:
 
     st.write(
         "Click the button below to check the scheduling mailbox for unread replies. "
-        "We will try to detect which option number the candidate has chosen."
+        "We try to detect which option number the candidate has chosen."
     )
 
     check_btn = st.button("Check scheduler inbox now")
@@ -609,14 +618,15 @@ with tab_inbox:
         st.success(f"Fetched and analysed {len(parsed_replies)} message(s).")
 
         for i, r in enumerate(parsed_replies, start=1):
-            with st.expander(
+            label = (
                 f"{i}. {r['subject']} — {r['from']} "
                 + (
                     f"(chosen option: {r['chosen_option']})"
                     if r["chosen_option"]
                     else "(no clear option detected)"
                 )
-            ):
+            )
+            with st.expander(label):
                 st.text(r["body"])
                 st.markdown(
                     f"**Detected option:** "
@@ -689,7 +699,10 @@ with tab_invites:
         else:
             location_text = st.text_area(
                 "Location & instructions (free text)",
-                value="PowerDash HR Offices, 123 Example Street, London.\nPlease report to reception.",
+                value=(
+                    "PowerDash HR Offices, 123 Example Street, London.\n"
+                    "Please report to reception."
+                ),
             )
 
         st.markdown("### Invite details")
@@ -717,7 +730,6 @@ with tab_invites:
         if st.button(
             "Generate & send calendar invites",
             type="primary",
-            use_container_width=False,
             disabled=not (SMTP_USER and hm_email and cand_email and recruiter_email),
         ):
             try:
@@ -744,10 +756,9 @@ with tab_invites:
                     ics_text=ics_text,
                 )
 
-            except Exception as e:
-                st.error(f"Error sending calendar invite: {e}")
-            else:
                 st.success(
                     "Calendar invite sent to candidate, hiring manager, and recruiter "
                     "from the scheduling mailbox. 🎉"
                 )
+            except Exception as e:
+                st.error(f"Error sending calendar invite: {e}")
